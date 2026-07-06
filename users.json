@@ -2,22 +2,22 @@
   "_instructions": "Add or remove users by editing this list. Each user needs: name, login_id (email used to sign in), password, and role (Admin / Campaign Manager / Analyst). Changes take effect immediately without restarting the server. Do not edit the _instructions key.",
   "users": [
     {
-      "name": "Admin User",
-      "login_id": "admin@hitfik.com",
-      "password": "HIT@2024",
-      "role": "Admin"
+      "name": "Sarthak",
+      "login_id": "sarthak.gunjal@wppmedia.com",
+      "password": "HIT@2026",
+      "role": "Admin & Developer"
     },
     {
-      "name": "Analyst One",
-      "login_id": "analyst@hitfik.com",
-      "password": "Analyst@2024",
-      "role": "Analyst"
+      "name": "Soumya",
+      "login_id": "soumya.das@wppmedia.com",
+      "password": "HIT@2026",
+      "role": "Sr Lead"
     },
     {
-      "name": "Manager One",
-      "login_id": "manager@hitfik.com",
-      "password": "Manager@2024",
-      "role": "Campaign Manager"
+      "name": "Varun",
+      "login_id": "varun.nair@wppmedia.com",
+      "password": "HIT@2026",
+      "role": "Lead"
     }
   ]
 }
