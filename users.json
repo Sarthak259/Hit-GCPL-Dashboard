@@ -1,0 +1,23 @@
+{
+  "_instructions": "Add or remove users by editing this list. Each user needs: name, login_id (email used to sign in), password, and role (Admin / Campaign Manager / Analyst). Changes take effect immediately without restarting the server. Do not edit the _instructions key.",
+  "users": [
+    {
+      "name": "Admin User",
+      "login_id": "admin@hitfik.com",
+      "password": "HIT@2024",
+      "role": "Admin"
+    },
+    {
+      "name": "Analyst One",
+      "login_id": "analyst@hitfik.com",
+      "password": "Analyst@2024",
+      "role": "Analyst"
+    },
+    {
+      "name": "Manager One",
+      "login_id": "manager@hitfik.com",
+      "password": "Manager@2024",
+      "role": "Campaign Manager"
+    }
+  ]
+}

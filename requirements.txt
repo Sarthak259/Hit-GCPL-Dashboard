@@ -1,0 +1,9 @@
+flask
+flask-cors
+requests
+apscheduler
+feedparser
+groq
+google-generativeai
+pdfplumber
+openpyxl
