@@ -2176,13 +2176,16 @@ CORS(app, origins=["*"])
 # ══════════════════════════════════════════════════════════════════════
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 _SEED_USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
-if not os.path.exists(USERS_FILE) and os.path.exists(_SEED_USERS_FILE):
+# Always sync from the repo's users.json on every deploy/restart, so editing
+# users.json in GitHub and pushing is enough to update logins — no need to
+# touch the Railway volume/console directly.
+if os.path.exists(_SEED_USERS_FILE):
     try:
         import shutil
         shutil.copy(_SEED_USERS_FILE, USERS_FILE)
-        log.info(f"Seeded {USERS_FILE} from repo default")
+        log.info(f"Synced {USERS_FILE} from repo users.json")
     except Exception as e:
-        log.error(f"Failed to seed users.json into DATA_DIR: {e}")
+        log.error(f"Failed to sync users.json into DATA_DIR: {e}")
 
 
 def load_users():
