@@ -1094,6 +1094,209 @@ def fetch_rainfall_forecast():
     return payload
 
 
+# ══════════════════════════════════════════════════════════════════════
+# FORECAST VALIDATION ENGINE — historical backtest (past N weeks)
+#
+# Compares what Open-Meteo's model FORECASTED for a past date against what
+# ACTUALLY happened (ERA5 reanalysis), for both rainfall and our contextual
+# risk formula. This proves out the scoring model using real historical
+# data — no fabricated numbers.
+#
+# NOTE ON THE NEWS COMPONENT: the live Contextual Risk Score is 40% news
+# signal, but historical news articles were never stored, so they cannot be
+# reconstructed for past dates. This backtest therefore scores a
+# "Weather-Only Contextual Score" — Rainfall, Rainy Days, and Temperature
+# only, with their weights redistributed proportionally (25/25/50 instead
+# of 15/15/30). This is disclosed in the API response and must be labeled
+# as such on the dashboard — do not present it as identical to the live
+# 4-factor score.
+# ══════════════════════════════════════════════════════════════════════
+HIST_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+HIST_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# Weather-only weight redistribution (news excluded — see note above)
+WO_RAIN_WEIGHT = 0.25
+WO_PRECIP_WEIGHT = 0.25
+WO_TEMP_WEIGHT = 0.50
+
+
+def _weather_only_contextual_score(heaviest_day_mm, rainy_days, temp_c, flood_alert=False):
+    rain_raw = _rainfall_raw(heaviest_day_mm)
+    precip_raw = _rainy_days_raw(rainy_days, flood_alert=flood_alert)
+    temp_raw = _temperature_raw(temp_c)
+    score = round(
+        rain_raw * WO_RAIN_WEIGHT + precip_raw * WO_PRECIP_WEIGHT + temp_raw * WO_TEMP_WEIGHT,
+        2
+    )
+    return score, _contextual_trigger_state(score)
+
+
+def _fetch_hist_chunk(url, chunk, start_date, end_date, extra_params=""):
+    lats = ",".join(str(d["lat"]) for d in chunk)
+    lons = ",".join(str(d["lon"]) for d in chunk)
+    full_url = (
+        f"{url}?latitude={lats}&longitude={lons}"
+        f"&start_date={start_date}&end_date={end_date}"
+        "&daily=precipitation_sum,temperature_2m_max,temperature_2m_min"
+        f"&timezone=Asia/Kolkata{extra_params}"
+    )
+    try:
+        resp = HTTP.get(full_url, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        raw = resp.json()
+        if isinstance(raw, dict):
+            raw = [raw]
+        if len(raw) == len(chunk):
+            return raw
+        log.warning(f"⚠️ Backtest chunk size mismatch for {url}: got {len(raw)}, expected {len(chunk)}")
+        return None
+    except Exception as e:
+        log.warning(f"⚠️ Backtest fetch failed ({url}): {e}")
+        return None
+
+
+def _weekly_ranges(num_weeks=4, reference_date=None):
+    """Returns a list of (label, start_date, end_date) tuples for the past
+    N full weeks, oldest first, each week Mon-Sun, ending before today
+    (today's data is incomplete so we don't include the current week)."""
+    ref = reference_date or datetime.now(timezone.utc).date()
+    this_monday = ref - timedelta(days=ref.weekday())
+    weeks = []
+    for i in range(num_weeks, 0, -1):
+        week_start = this_monday - timedelta(weeks=i)
+        week_end = week_start + timedelta(days=6)
+        label = f"{week_start.strftime('%d %b')} – {week_end.strftime('%d %b')}"
+        weeks.append((label, week_start.isoformat(), week_end.isoformat()))
+    return weeks
+
+
+def compute_forecast_accuracy(num_weeks=4, sample_size=20):
+    """
+    PRIMARY BACKTEST — pulls real historical forecast data (what the model
+    predicted) and real historical actual/reanalysis data (what happened)
+    for the past `num_weeks` full weeks, for a representative sample of
+    districts, and computes:
+      - Rainfall forecast accuracy (predicted mm vs actual mm)
+      - Weather-only Contextual Risk Score accuracy (predicted trigger
+        state vs actual trigger state)
+    Sampling a subset of districts (default 20 of 60+) keeps this fast and
+    within free-tier API rate limits; increase sample_size for a fuller run.
+    """
+    sample_districts = DISTRICTS[:sample_size] if sample_size < len(DISTRICTS) else DISTRICTS
+    weeks = _weekly_ranges(num_weeks)
+    CHUNK_SIZE = 15
+    chunks = list(_chunked(sample_districts, CHUNK_SIZE))
+
+    weekly_results = []
+
+    for label, start_date, end_date in weeks:
+        # Fetch FORECAST (what the model said would happen) and ACTUAL
+        # (ERA5 reanalysis — what really happened) for every district chunk.
+        forecast_by_name = {}
+        actual_by_name = {}
+
+        for chunk in chunks:
+            fc_raw = _fetch_hist_chunk(HIST_FORECAST_URL, chunk, start_date, end_date)
+            ac_raw = _fetch_hist_chunk(HIST_ARCHIVE_URL, chunk, start_date, end_date)
+            if fc_raw:
+                for d, raw in zip(chunk, fc_raw):
+                    forecast_by_name[d["name"]] = raw
+            if ac_raw:
+                for d, raw in zip(chunk, ac_raw):
+                    actual_by_name[d["name"]] = raw
+
+        district_rows = []
+        rainfall_errors_pct = []
+        trigger_matches = 0
+        trigger_total = 0
+
+        for d in sample_districts:
+            fc = forecast_by_name.get(d["name"])
+            ac = actual_by_name.get(d["name"])
+            if not fc or not ac:
+                continue
+
+            fc_daily = fc.get("daily", {})
+            ac_daily = ac.get("daily", {})
+            fc_rain_days = fc_daily.get("precipitation_sum", []) or []
+            ac_rain_days = ac_daily.get("precipitation_sum", []) or []
+            fc_tmax_days = fc_daily.get("temperature_2m_max", []) or []
+            ac_tmax_days = ac_daily.get("temperature_2m_max", []) or []
+
+            if not fc_rain_days or not ac_rain_days:
+                continue
+
+            fc_total_rain = round(sum(x for x in fc_rain_days if x is not None), 1)
+            ac_total_rain = round(sum(x for x in ac_rain_days if x is not None), 1)
+            fc_heaviest = round(max((x for x in fc_rain_days if x is not None), default=0), 1)
+            ac_heaviest = round(max((x for x in ac_rain_days if x is not None), default=0), 1)
+            fc_rainy_days = sum(1 for x in fc_rain_days if x and x > 0)
+            ac_rainy_days = sum(1 for x in ac_rain_days if x and x > 0)
+            fc_avg_temp = round(sum(x for x in fc_tmax_days if x is not None) / max(len(fc_tmax_days), 1), 1)
+            ac_avg_temp = round(sum(x for x in ac_tmax_days if x is not None) / max(len(ac_tmax_days), 1), 1)
+
+            # Rainfall accuracy: error as % of actual (capped so a near-zero
+            # actual with a near-zero forecast doesn't blow up the %).
+            denom = max(ac_total_rain, 5.0)
+            rain_error_pct = min(abs(fc_total_rain - ac_total_rain) / denom * 100, 100)
+            rainfall_errors_pct.append(rain_error_pct)
+
+            fc_score, fc_trigger = _weather_only_contextual_score(fc_heaviest, fc_rainy_days, fc_avg_temp)
+            ac_score, ac_trigger = _weather_only_contextual_score(ac_heaviest, ac_rainy_days, ac_avg_temp)
+
+            trigger_total += 1
+            if fc_trigger == ac_trigger:
+                trigger_matches += 1
+
+            district_rows.append({
+                "name": d["name"],
+                "state": d["state"],
+                "predicted_rainfall_mm": fc_total_rain,
+                "actual_rainfall_mm": ac_total_rain,
+                "rainfall_error_pct": round(rain_error_pct, 1),
+                "predicted_score": fc_score,
+                "actual_score": ac_score,
+                "predicted_trigger": fc_trigger,
+                "actual_trigger": ac_trigger,
+                "trigger_match": fc_trigger == ac_trigger,
+            })
+
+        avg_rain_accuracy = round(100 - (sum(rainfall_errors_pct) / len(rainfall_errors_pct)), 1) if rainfall_errors_pct else None
+        trigger_accuracy = round((trigger_matches / trigger_total) * 100, 1) if trigger_total else None
+
+        weekly_results.append({
+            "week_label": label,
+            "start_date": start_date,
+            "end_date": end_date,
+            "districts_evaluated": len(district_rows),
+            "rainfall_forecast_accuracy_pct": avg_rain_accuracy,
+            "contextual_score_accuracy_pct": trigger_accuracy,
+            "districts": district_rows,
+        })
+
+    overall_rain = [w["rainfall_forecast_accuracy_pct"] for w in weekly_results if w["rainfall_forecast_accuracy_pct"] is not None]
+    overall_trigger = [w["contextual_score_accuracy_pct"] for w in weekly_results if w["contextual_score_accuracy_pct"] is not None]
+
+    return {
+        "weeks": weekly_results,
+        "overall_rainfall_accuracy_pct": round(sum(overall_rain) / len(overall_rain), 1) if overall_rain else None,
+        "overall_contextual_accuracy_pct": round(sum(overall_trigger) / len(overall_trigger), 1) if overall_trigger else None,
+        "sample_size": len(sample_districts),
+        "total_districts": len(DISTRICTS),
+        "methodology": (
+            "Rainfall accuracy compares Open-Meteo's archived forecast for each "
+            "past week against ERA5 reanalysis actuals for the same week. "
+            "Contextual Score accuracy compares predicted vs actual trigger "
+            "state (BOOST/PREPARE/MONITOR/LOW) using a Weather-Only version of "
+            "the scoring formula (Rainfall 25% + Rainy Days 25% + Temperature "
+            "50%) — the live News component (40% weight) is excluded here "
+            "because historical news signal data was not being stored yet, "
+            "so it cannot be reconstructed for past weeks."
+        ),
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def fetch_air_quality():
     lats = ",".join(str(d["lat"]) for d in DISTRICTS)
     lons = ",".join(str(d["lon"]) for d in DISTRICTS)
@@ -2381,6 +2584,32 @@ def api_risk_contextual():
     news_articles = news_data.get("articles", [])
     rainfall_forecast_data = cache.get("rainfall_forecast_all") or fetch_rainfall_forecast()
     result = compute_contextual_risk(weather_data, news_total, news_articles, rainfall_forecast_data)
+    return jsonify(result)
+
+
+# ── Forecast Validation Engine (historical backtest) ────────────────
+@app.route("/api/analytics/forecast-accuracy", methods=["GET"])
+def api_forecast_accuracy():
+    """
+    Backtests the rainfall forecast and Weather-Only Contextual Score against
+    real historical data (Open-Meteo archived forecast vs ERA5 reanalysis)
+    for the past N weeks. Cached for 6 hours since this pulls a fair amount
+    of historical data per district and doesn't change intra-day.
+    """
+    num_weeks = int(request.args.get("weeks", 4))
+    sample_size = int(request.args.get("sample", 20))
+    force = request.args.get("force", "false").lower() == "true"
+
+    cache_key = f"forecast_accuracy_{num_weeks}_{sample_size}"
+    if force:
+        cache.delete(cache_key)
+
+    cached = cache.get(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    result = compute_forecast_accuracy(num_weeks=num_weeks, sample_size=sample_size)
+    cache.set(cache_key, result, ttl=21600)  # 6 hours
     return jsonify(result)
 
 
