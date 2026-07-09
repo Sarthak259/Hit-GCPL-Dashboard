@@ -35,6 +35,7 @@ import json
 import re
 import csv
 import io
+import time as time_module
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -3008,47 +3009,75 @@ if __name__ == "__main__":
                     CONFIG[k] = v
         log.info(f"✅ Loaded .env from {env_path}")
 
-    log.info("📡 Fetching initial weather data...")
+    # ── COLD START SEQUENCING: fetch ONE at a time with cooldowns ────
+    # Open-Meteo's free tier rate-limits by IP — firing weather, rainfall
+    # forecast, AND air quality at the same instant guarantees 429s.
+    # Instead, we sequence them with deliberate cooldowns, and defer the
+    # secondary fetches to background threads so the server starts fast.
+    
+    log.info("📡 [1/3] Fetching initial weather data...")
     fetch_weather()
+    time_module.sleep(8)  # cooldown before next Open-Meteo call
 
     log.info("🦟 Loading saved dengue burden data (if any)...")
     _load_dengue_burden_from_disk()
 
-    log.info("🌧 Fetching initial 7-day rainfall forecast (background)...")
-    time.sleep(5)  # let Open-Meteo's rate limit cool down after the weather burst above
-    threading.Thread(target=fetch_rainfall_forecast, daemon=True).start()
+    # Defer rainfall forecast to background — the dashboard can still load
+    # without it, and it uses the same Open-Meteo endpoint, so running it
+    # immediately after weather guarantees a 429.
+    log.info("🌧 [2/3] Fetching initial 7-day rainfall forecast (background — delayed 15s)...")
+    def _deferred_rainfall():
+        time_module.sleep(15)
+        fetch_rainfall_forecast()
+    threading.Thread(target=_deferred_rainfall, daemon=True).start()
 
+    # News and Air Quality use DIFFERENT APIs, so they can run immediately
+    # without affecting Open-Meteo's rate limit.
     log.info("📰 Fetching initial news feed (background)...")
     threading.Thread(target=fetch_news, daemon=True).start()
 
-    log.info("💨 Fetching initial air quality data (background)...")
-    threading.Thread(target=fetch_air_quality, daemon=True).start()
+    log.info("💨 [3/3] Fetching initial air quality data (background — delayed 5s)...")
+    def _deferred_aq():
+        time_module.sleep(5)
+        fetch_air_quality()
+    threading.Thread(target=_deferred_aq, daemon=True).start()
 
+    # Scheduler: stagger job start times so weather and rainfall forecast
+    # never fire in the same instant (that was doubling the burst).
     scheduler = BackgroundScheduler(daemon=True)
-    scheduler.add_job(scheduled_weather_refresh, "interval", seconds=CONFIG["WEATHER_REFRESH_SEC"], id="weather")
-    # Offset rainfall's first run by 90s so it doesn't fire in the same
-    # instant as the weather job every 10 minutes — running both at once
-    # doubles the simultaneous burst of requests against Open-Meteo and was
-    # part of what triggered the 429 rate-limit storms.
+    
+    base_time = datetime.now(timezone.utc)
+    weather_interval = CONFIG["WEATHER_REFRESH_SEC"]  # 1800s = 30min
+    
     scheduler.add_job(
-        scheduled_rainfall_forecast_refresh, "interval", seconds=CONFIG["WEATHER_REFRESH_SEC"],
-        id="rainfall_forecast", next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
+        scheduled_weather_refresh, "interval", seconds=weather_interval,
+        id="weather",
+        next_run_time=base_time + timedelta(seconds=weather_interval),
     )
-    scheduler.add_job(scheduled_news_refresh, "interval", seconds=CONFIG["NEWS_REFRESH_SEC"], id="news_rss")
-    scheduler.add_job(scheduled_newsdata_refresh, "interval", seconds=CONFIG["NEWSDATA_REFRESH_SEC"], id="news_structured")
-    scheduler.add_job(scheduled_aq_refresh, "interval", seconds=CONFIG["AQ_REFRESH_SEC"], id="aq")
+    # Offset rainfall by 120s so it NEVER fires at the same second as weather
+    scheduler.add_job(
+        scheduled_rainfall_forecast_refresh, "interval", seconds=weather_interval,
+        id="rainfall_forecast",
+        next_run_time=base_time + timedelta(seconds=weather_interval + 120),
+    )
+    scheduler.add_job(
+        scheduled_news_refresh, "interval", seconds=CONFIG["NEWS_REFRESH_SEC"],
+        id="news_rss",
+    )
+    scheduler.add_job(
+        scheduled_newsdata_refresh, "interval", seconds=CONFIG["NEWSDATA_REFRESH_SEC"],
+        id="news_structured",
+    )
+    scheduler.add_job(
+        scheduled_aq_refresh, "interval", seconds=CONFIG["AQ_REFRESH_SEC"],
+        id="aq",
+    )
     scheduler.start()
-    log.info(f"⏱ Scheduler started — weather every {CONFIG['WEATHER_REFRESH_SEC']//60}min")
+    log.info(f"⏱ Scheduler started — weather every {weather_interval//60}min (staggered)")
 
     log.info(f"🚀 HIT RADAR Backend ready → http://localhost:5000")
     log.info(f"📋 Monitoring {len(DISTRICTS)} districts across India")
     log.info("📋 /api/risk/compute → PRIMARY risk model with map colors")
 
     port = int(os.environ.get("PORT", 5000))
-    # threaded=True — CRITICAL: without this, Flask's dev server handles ONE
-    # request at a time. A slow rainfall-forecast fetch (retrying through a
-    # 429 storm) would block EVERY other endpoint — weather, news, chat, all
-    # of it — until it finished, which is exactly the "whole dashboard takes
-    # 5 minutes to load" symptom. With threading on, one slow request no
-    # longer freezes the rest of the app.
     app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
