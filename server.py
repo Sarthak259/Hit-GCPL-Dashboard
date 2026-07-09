@@ -135,7 +135,7 @@ CONFIG = {
     "OWM_API_KEY":           os.getenv("OWM_API_KEY",  ""),
     "WAQI_API_KEY":          os.getenv("WAQI_API_KEY", ""),
 
-    "WEATHER_REFRESH_SEC":   600,
+    "WEATHER_REFRESH_SEC":   1800,  # was 600 (10min) — bumped to 30min to cut Open-Meteo call volume
     "NEWS_REFRESH_SEC":      300,
     "NEWSDATA_REFRESH_SEC":  1800,
     "AQ_REFRESH_SEC":        3600,
@@ -823,7 +823,7 @@ def fetch_weather():
     failed = []
     stale_used = []
 
-    CHUNK_SIZE = 28
+    CHUNK_SIZE = 56
     chunks = list(_chunked(DISTRICTS, CHUNK_SIZE))
 
     # Throttled: only a couple of chunk requests in flight at once, with a
@@ -845,23 +845,18 @@ def fetch_weather():
                 raw_list = None
 
             if raw_list is None:
-                log.warning(f"⚠️ Weather chunk failed, retrying {len(chunk)} districts individually")
-                time.sleep(3)  # let the rate limit cool down before hammering individually
-                with ThreadPoolExecutor(max_workers=min(2, len(chunk))) as sub_executor:
-                    future_to_d = {sub_executor.submit(_fetch_single_district, d): d for d in chunk}
-                    for f in as_completed(future_to_d):
-                        d = future_to_d[f]
-                        try:
-                            result = f.result()
-                        except Exception:
-                            result = None
-                        if result:
-                            results.append(result)
-                        elif d["name"] in prev_by_name:
-                            results.append(prev_by_name[d["name"]])
-                            stale_used.append(d["name"])
-                        else:
-                            failed.append(d["name"])
+                # Don't hammer individually anymore — if the batch got 429'd,
+                # the whole IP is rate-limited right now, so per-district
+                # retries just add more requests into the same wall. Fall
+                # straight back to last-known-good cache for this chunk and
+                # let the next scheduled cycle try again.
+                log.warning(f"⚠️ Weather chunk failed (rate limited) — using stale cache for {len(chunk)} districts")
+                for d in chunk:
+                    if d["name"] in prev_by_name:
+                        results.append(prev_by_name[d["name"]])
+                        stale_used.append(d["name"])
+                    else:
+                        failed.append(d["name"])
                 continue
 
             for d, raw in zip(chunk, raw_list):
@@ -1077,7 +1072,7 @@ def fetch_rainfall_forecast():
     failed = []
     stale_used = []
 
-    CHUNK_SIZE = 28
+    CHUNK_SIZE = 56
     chunks = list(_chunked(DISTRICTS, CHUNK_SIZE))
 
     # Throttled: only a couple of chunk requests in flight at once, with a
@@ -1099,25 +1094,18 @@ def fetch_rainfall_forecast():
                 raw_list = None
 
             if raw_list is None:
-                # Whole batch failed — retry this chunk's districts one by one
-                # in parallel rather than giving up on all of them.
-                log.warning(f"⚠️ Rainfall forecast chunk failed, retrying {len(chunk)} districts individually")
-                time.sleep(3)  # let the rate limit cool down before hammering individually
-                with ThreadPoolExecutor(max_workers=min(2, len(chunk))) as sub_executor:
-                    future_to_d = {sub_executor.submit(_fetch_single_rainfall_forecast, d): d for d in chunk}
-                    for f in as_completed(future_to_d):
-                        d = future_to_d[f]
-                        try:
-                            result = f.result()
-                        except Exception:
-                            result = None
-                        if result:
-                            results.append(result)
-                        elif d["name"] in prev_by_name:
-                            results.append(prev_by_name[d["name"]])
-                            stale_used.append(d["name"])
-                        else:
-                            failed.append(d["name"])
+                # Don't hammer individually anymore — if the batch got 429'd,
+                # the whole IP is rate-limited right now, so per-district
+                # retries just add more requests into the same wall. Fall
+                # straight back to last-known-good cache for this chunk and
+                # let the next scheduled cycle try again.
+                log.warning(f"⚠️ Rainfall forecast chunk failed (rate limited) — using stale cache for {len(chunk)} districts")
+                for d in chunk:
+                    if d["name"] in prev_by_name:
+                        results.append(prev_by_name[d["name"]])
+                        stale_used.append(d["name"])
+                    else:
+                        failed.append(d["name"])
                 continue
 
             for d, raw in zip(chunk, raw_list):
