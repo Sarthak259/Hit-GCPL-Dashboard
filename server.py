@@ -79,11 +79,18 @@ log = logging.getLogger("hit_radar")
 def _build_http_session():
     session = requests.Session()
     retry = Retry(
-        total=3,
-        connect=3,
+        total=2,
+        connect=2,
         read=2,
-        backoff_factor=0.6,          # 0.6s, 1.2s, 2.4s between transport-level retries
-        status_forcelist=[429, 500, 502, 503, 504],
+        backoff_factor=0.6,          # 0.6s, 1.2s between transport-level retries
+        # NOTE: 429 (rate limit) deliberately excluded here. Retrying a 429
+        # at the transport layer AND then again in our own app-level retry
+        # loop below used to multiply every rate-limited request by up to
+        # 3x-9x, which is exactly the wrong response to a rate limit and is
+        # what caused the sustained 429 storms. Only true transient errors
+        # get an automatic transport-level retry; 429s are handled once,
+        # deliberately, with a real cooldown, by the app-level retry loops.
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
@@ -97,6 +104,23 @@ HTTP = _build_http_session()
 # respond under load; give reads more room while still failing fast on
 # dead connections.
 HTTP_TIMEOUT = (8, 25)
+
+
+def _retry_sleep(exc, attempt, base=2):
+    """How long to wait before the next attempt. A 429 gets a real cooldown
+    (respecting Retry-After if Open-Meteo sends one) instead of the short
+    2s/4s backoff used for ordinary transient errors — hammering a rate
+    limit with quick retries just keeps the limit triggered for longer."""
+    resp = getattr(exc, "response", None)
+    if resp is not None and resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(float(retry_after), 5)
+            except ValueError:
+                pass
+        return min(10 * attempt, 30)
+    return base * attempt
 
 # ══════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -599,6 +623,26 @@ class Cache:
 
 cache = Cache()
 
+# ── Single-flight fetch: prevents concurrent requests from each kicking off
+# their own duplicate expensive fetch (e.g. weather/risk/contextual/chat
+# routes all read weather_data — if they race while the cache is cold, that
+# used to mean 3-4 SIMULTANEOUS full 60-district Open-Meteo fetches instead
+# of 1, which is a big part of what triggered the 429 rate-limit storms. ──
+_fetch_locks = {}
+_fetch_locks_guard = threading.Lock()
+
+def get_or_fetch(key, fetch_fn):
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    with _fetch_locks_guard:
+        lock = _fetch_locks.setdefault(key, threading.Lock())
+    with lock:
+        cached = cache.get(key)  # another thread may have just finished fetching
+        if cached is not None:
+            return cached
+        return fetch_fn()
+
 
 # ══════════════════════════════════════════════════════════════════════
 # WEATHER SERVICE
@@ -719,7 +763,7 @@ def _fetch_single_district(d, retries=3, backoff=2):
         except Exception as e:
             log.warning(f"⚠️ {d['name']} attempt {attempt}/{retries} failed: {e}")
             if attempt < retries:
-                time.sleep(backoff * attempt)  # 2s, 4s, 6s... — exponential-ish backoff
+                time.sleep(_retry_sleep(e, attempt))
     log.error(f"❌ Weather failed for {d['name']} after {retries} attempts")
     return None
 
@@ -757,7 +801,7 @@ def _fetch_weather_chunk(chunk, retries=2, backoff=2):
         except Exception as e:
             log.warning(f"⚠️ Weather chunk attempt {attempt}/{retries} failed: {e}")
             if attempt < retries:
-                time.sleep(backoff * attempt)
+                time.sleep(_retry_sleep(e, attempt))
     return None
 
 
@@ -794,7 +838,7 @@ def fetch_weather():
 
             if raw_list is None:
                 log.warning(f"⚠️ Weather chunk failed, retrying {len(chunk)} districts individually")
-                with ThreadPoolExecutor(max_workers=min(10, len(chunk))) as sub_executor:
+                with ThreadPoolExecutor(max_workers=min(3, len(chunk))) as sub_executor:
                     future_to_d = {sub_executor.submit(_fetch_single_district, d): d for d in chunk}
                     for f in as_completed(future_to_d):
                         d = future_to_d[f]
@@ -954,6 +998,7 @@ def _fetch_single_rainfall_forecast(d, retries=3, backoff=2):
         "&forecast_days=7"
     )
     for attempt in range(1, retries + 1):
+        exc = None
         try:
             resp = HTTP.get(url, timeout=HTTP_TIMEOUT)
             resp.raise_for_status()
@@ -964,9 +1009,10 @@ def _fetch_single_rainfall_forecast(d, retries=3, backoff=2):
             if parsed:
                 return parsed
         except Exception as e:
+            exc = e
             log.warning(f"⚠️ Rainfall forecast {d['name']} attempt {attempt}/{retries} failed: {e}")
         if attempt < retries:
-            time.sleep(backoff * attempt)
+            time.sleep(_retry_sleep(exc, attempt) if exc else backoff * attempt)
     log.error(f"❌ Rainfall forecast failed for {d['name']} after {retries} attempts")
     return None
 
@@ -1039,7 +1085,7 @@ def fetch_rainfall_forecast():
                 # Whole batch failed — retry this chunk's districts one by one
                 # in parallel rather than giving up on all of them.
                 log.warning(f"⚠️ Rainfall forecast chunk failed, retrying {len(chunk)} districts individually")
-                with ThreadPoolExecutor(max_workers=min(10, len(chunk))) as sub_executor:
+                with ThreadPoolExecutor(max_workers=min(3, len(chunk))) as sub_executor:
                     future_to_d = {sub_executor.submit(_fetch_single_rainfall_forecast, d): d for d in chunk}
                     for f in as_completed(future_to_d):
                         d = future_to_d[f]
@@ -2459,13 +2505,13 @@ def api_weather_all():
     force = request.args.get("force", "false").lower() == "true"
     if force:
         cache.delete("weather_all")
-    data = cache.get("weather_all") or fetch_weather()
+    data = get_or_fetch("weather_all", fetch_weather)
     return jsonify(data)
 
 
 @app.route("/api/weather/district/<name>", methods=["GET"])
 def api_weather_district(name):
-    data = cache.get("weather_all") or fetch_weather()
+    data = get_or_fetch("weather_all", fetch_weather)
     match = next((d for d in data.get("districts", []) if d["name"].lower() == name.lower()), None)
     if not match:
         return jsonify({"error": "District not found"}), 404
@@ -2478,14 +2524,14 @@ def api_rainfall_forecast():
     force = request.args.get("force", "false").lower() == "true"
     if force:
         cache.delete("rainfall_forecast_all")
-    data = cache.get("rainfall_forecast_all") or fetch_rainfall_forecast()
+    data = get_or_fetch("rainfall_forecast_all", fetch_rainfall_forecast)
     return jsonify(data)
 
 
 # ── Air Quality ──────────────────────────────────────────────────────
 @app.route("/api/airquality/all", methods=["GET"])
 def api_aq_all():
-    data = cache.get("aq_all") or fetch_air_quality()
+    data = get_or_fetch("aq_all", fetch_air_quality)
     return jsonify(data)
 
 
@@ -2495,13 +2541,13 @@ def api_news_feed():
     force = request.args.get("force", "false").lower() == "true"
     if force:
         cache.delete("news_feed")
-    data = cache.get("news_feed") or fetch_news()
+    data = get_or_fetch("news_feed", fetch_news)
     return jsonify(data)
 
 
 @app.route("/api/news/signal", methods=["GET"])
 def api_news_signal():
-    data = cache.get("news_feed") or fetch_news()
+    data = get_or_fetch("news_feed", fetch_news)
     return jsonify({
         "signal_score": data.get("signal_score"),
         "signal_level": data.get("signal_level"),
@@ -2523,11 +2569,11 @@ def api_risk_compute():
     This drives Live Risk Map, Trigger States, and all risk displays.
     """
     force = request.args.get("force", "false").lower() == "true"
-    weather_data = cache.get("weather_all") or fetch_weather()
-    news_data = cache.get("news_feed") or fetch_news()
+    weather_data = get_or_fetch("weather_all", fetch_weather)
+    news_data = get_or_fetch("news_feed", fetch_news)
     news_total = news_data.get("total", 0)
     news_articles = news_data.get("articles", [])
-    rainfall_forecast_data = cache.get("rainfall_forecast_all") or fetch_rainfall_forecast()
+    rainfall_forecast_data = get_or_fetch("rainfall_forecast_all", fetch_rainfall_forecast)
     
     # Compute contextual risk (primary model)
     contextual_result = compute_contextual_risk(weather_data, news_total, news_articles, rainfall_forecast_data)
@@ -2578,11 +2624,11 @@ def api_risk_compute():
 def api_risk_contextual():
     """Direct access to contextual risk score data with map colors."""
     force = request.args.get("force", "false").lower() == "true"
-    weather_data = cache.get("weather_all") or fetch_weather()
-    news_data = cache.get("news_feed") or fetch_news()
+    weather_data = get_or_fetch("weather_all", fetch_weather)
+    news_data = get_or_fetch("news_feed", fetch_news)
     news_total = news_data.get("total", 0)
     news_articles = news_data.get("articles", [])
-    rainfall_forecast_data = cache.get("rainfall_forecast_all") or fetch_rainfall_forecast()
+    rainfall_forecast_data = get_or_fetch("rainfall_forecast_all", fetch_rainfall_forecast)
     result = compute_contextual_risk(weather_data, news_total, news_articles, rainfall_forecast_data)
     return jsonify(result)
 
@@ -2629,8 +2675,8 @@ def api_ai_brief():
 
 @app.route("/api/ai/daily-summary", methods=["POST"])
 def api_ai_daily_summary():
-    weather_data = cache.get("weather_all") or fetch_weather()
-    news_data = cache.get("news_feed") or fetch_news()
+    weather_data = get_or_fetch("weather_all", fetch_weather)
+    news_data = get_or_fetch("news_feed", fetch_news)
     date_str = (request.json or {}).get("date")
     contextual_data = (request.json or {}).get("contextual_data")
     result = generate_daily_summary(weather_data, news_data, date_str, contextual_data)
@@ -2642,13 +2688,13 @@ def api_ai_chat():
     payload = request.json
     if not payload or not payload.get("message"):
         return jsonify({"error": "message required"}), 400
-    weather_data = cache.get("weather_all") or fetch_weather()
+    weather_data = get_or_fetch("weather_all", fetch_weather)
     news_data    = cache.get("news_feed")    or fetch_news()
 
     # Feed the PRIMARY model (contextual risk) into the chatbot context
     news_total    = news_data.get("total", 0)
     news_articles = news_data.get("articles", [])
-    rainfall_forecast_data = cache.get("rainfall_forecast_all") or fetch_rainfall_forecast()
+    rainfall_forecast_data = get_or_fetch("rainfall_forecast_all", fetch_rainfall_forecast)
     risk_data     = compute_contextual_risk(weather_data, news_total, news_articles, rainfall_forecast_data)
 
     result = ai_chat(
@@ -2663,7 +2709,7 @@ def api_ai_chat():
 
 @app.route("/api/ai/news-narrative", methods=["GET"])
 def api_ai_news_narrative():
-    news_data = cache.get("news_feed") or fetch_news()
+    news_data = get_or_fetch("news_feed", fetch_news)
     return jsonify(generate_news_narrative(news_data))
 
 
@@ -2678,11 +2724,11 @@ def api_alerts_send():
 
 @app.route("/api/alerts/bulk", methods=["POST"])
 def api_alerts_bulk():
-    weather_data = cache.get("weather_all") or fetch_weather()
-    news_data = cache.get("news_feed") or fetch_news()
+    weather_data = get_or_fetch("weather_all", fetch_weather)
+    news_data = get_or_fetch("news_feed", fetch_news)
     news_total = news_data.get("total", 0)
     news_articles = news_data.get("articles", [])
-    rainfall_forecast_data = cache.get("rainfall_forecast_all") or fetch_rainfall_forecast()
+    rainfall_forecast_data = get_or_fetch("rainfall_forecast_all", fetch_rainfall_forecast)
     contextual_result = compute_contextual_risk(weather_data, news_total, news_articles, rainfall_forecast_data)
     
     active = [
@@ -2698,8 +2744,8 @@ def api_alerts_bulk():
 
 @app.route("/api/alerts/daily-brief", methods=["POST"])
 def api_alerts_daily_brief():
-    weather_data = cache.get("weather_all") or fetch_weather()
-    news_data = cache.get("news_feed") or fetch_news()
+    weather_data = get_or_fetch("weather_all", fetch_weather)
+    news_data = get_or_fetch("news_feed", fetch_news)
     return jsonify(send_telegram("Daily brief sent via API"))
 
 
@@ -2973,7 +3019,14 @@ if __name__ == "__main__":
 
     scheduler = BackgroundScheduler(daemon=True)
     scheduler.add_job(scheduled_weather_refresh, "interval", seconds=CONFIG["WEATHER_REFRESH_SEC"], id="weather")
-    scheduler.add_job(scheduled_rainfall_forecast_refresh, "interval", seconds=CONFIG["WEATHER_REFRESH_SEC"], id="rainfall_forecast")
+    # Offset rainfall's first run by 90s so it doesn't fire in the same
+    # instant as the weather job every 10 minutes — running both at once
+    # doubles the simultaneous burst of requests against Open-Meteo and was
+    # part of what triggered the 429 rate-limit storms.
+    scheduler.add_job(
+        scheduled_rainfall_forecast_refresh, "interval", seconds=CONFIG["WEATHER_REFRESH_SEC"],
+        id="rainfall_forecast", next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
+    )
     scheduler.add_job(scheduled_news_refresh, "interval", seconds=CONFIG["NEWS_REFRESH_SEC"], id="news_rss")
     scheduler.add_job(scheduled_newsdata_refresh, "interval", seconds=CONFIG["NEWSDATA_REFRESH_SEC"], id="news_structured")
     scheduler.add_job(scheduled_aq_refresh, "interval", seconds=CONFIG["AQ_REFRESH_SEC"], id="aq")
@@ -2985,4 +3038,10 @@ if __name__ == "__main__":
     log.info("📋 /api/risk/compute → PRIMARY risk model with map colors")
 
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    # threaded=True — CRITICAL: without this, Flask's dev server handles ONE
+    # request at a time. A slow rainfall-forecast fetch (retrying through a
+    # 429 storm) would block EVERY other endpoint — weather, news, chat, all
+    # of it — until it finished, which is exactly the "whole dashboard takes
+    # 5 minutes to load" symptom. With threading on, one slow request no
+    # longer freezes the rest of the app.
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
