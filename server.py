@@ -823,11 +823,19 @@ def fetch_weather():
     failed = []
     stale_used = []
 
-    CHUNK_SIZE = 15
+    CHUNK_SIZE = 28
     chunks = list(_chunked(DISTRICTS, CHUNK_SIZE))
 
-    with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
-        future_to_chunk = {executor.submit(_fetch_weather_chunk, c): c for c in chunks}
+    # Throttled: only a couple of chunk requests in flight at once, with a
+    # short stagger between launches, instead of firing every chunk in the
+    # same instant. Open-Meteo's 429s were driven by burst concurrency, not
+    # total volume — this keeps the burst small.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_to_chunk = {}
+        for i, c in enumerate(chunks):
+            if i > 0:
+                time.sleep(1.5)
+            future_to_chunk[executor.submit(_fetch_weather_chunk, c)] = c
         for future in as_completed(future_to_chunk):
             chunk = future_to_chunk[future]
             try:
@@ -838,7 +846,8 @@ def fetch_weather():
 
             if raw_list is None:
                 log.warning(f"⚠️ Weather chunk failed, retrying {len(chunk)} districts individually")
-                with ThreadPoolExecutor(max_workers=min(3, len(chunk))) as sub_executor:
+                time.sleep(3)  # let the rate limit cool down before hammering individually
+                with ThreadPoolExecutor(max_workers=min(2, len(chunk))) as sub_executor:
                     future_to_d = {sub_executor.submit(_fetch_single_district, d): d for d in chunk}
                     for f in as_completed(future_to_d):
                         d = future_to_d[f]
@@ -1068,11 +1077,19 @@ def fetch_rainfall_forecast():
     failed = []
     stale_used = []
 
-    CHUNK_SIZE = 15
+    CHUNK_SIZE = 28
     chunks = list(_chunked(DISTRICTS, CHUNK_SIZE))
 
-    with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
-        future_to_chunk = {executor.submit(_fetch_rainfall_forecast_chunk, c): c for c in chunks}
+    # Throttled: only a couple of chunk requests in flight at once, with a
+    # short stagger between launches, instead of firing every chunk in the
+    # same instant. Open-Meteo's 429s were driven by burst concurrency, not
+    # total volume — this keeps the burst small.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_to_chunk = {}
+        for i, c in enumerate(chunks):
+            if i > 0:
+                time.sleep(1.5)
+            future_to_chunk[executor.submit(_fetch_rainfall_forecast_chunk, c)] = c
         for future in as_completed(future_to_chunk):
             chunk = future_to_chunk[future]
             try:
@@ -1085,7 +1102,8 @@ def fetch_rainfall_forecast():
                 # Whole batch failed — retry this chunk's districts one by one
                 # in parallel rather than giving up on all of them.
                 log.warning(f"⚠️ Rainfall forecast chunk failed, retrying {len(chunk)} districts individually")
-                with ThreadPoolExecutor(max_workers=min(3, len(chunk))) as sub_executor:
+                time.sleep(3)  # let the rate limit cool down before hammering individually
+                with ThreadPoolExecutor(max_workers=min(2, len(chunk))) as sub_executor:
                     future_to_d = {sub_executor.submit(_fetch_single_rainfall_forecast, d): d for d in chunk}
                     for f in as_completed(future_to_d):
                         d = future_to_d[f]
@@ -3009,6 +3027,7 @@ if __name__ == "__main__":
     _load_dengue_burden_from_disk()
 
     log.info("🌧 Fetching initial 7-day rainfall forecast (background)...")
+    time.sleep(5)  # let Open-Meteo's rate limit cool down after the weather burst above
     threading.Thread(target=fetch_rainfall_forecast, daemon=True).start()
 
     log.info("📰 Fetching initial news feed (background)...")
