@@ -138,7 +138,7 @@ CONFIG = {
 
     "WEATHER_REFRESH_SEC":   1800,  # was 600 (10min) — bumped to 30min to cut Open-Meteo call volume
     "NEWS_REFRESH_SEC":      300,
-    "NEWSDATA_REFRESH_SEC":  1800,
+    "NEWSDATA_REFRESH_SEC":  3600,
     "AQ_REFRESH_SEC":        3600,
     "THRESH_RAIN_MM":        10.0,
     "THRESH_HUMIDITY_PCT":   80.0,
