@@ -2072,6 +2072,13 @@ def generate_news_narrative(news_data):
     return call_ai(system, user, prefer="groq")
 
 
+PLAN_REFERENCE_DISCLAIMER = (
+    "⚠️ Reference only — this AI-generated output (including budget %, channels, "
+    "timeline, and KPIs) is meant to help the Planning team quickly gauge current "
+    "market/risk conditions. It is NOT a final plan. Do not execute as-is — final "
+    "campaign decisions must be reviewed and approved by the Planning team."
+)
+
 DETAIL_INTENT_RE = re.compile(
     r'\b(detail(?:ed)?|in-?depth|elaborate|comprehensive|full\s+plan|complete\s+plan|'
     r'breakdown|thorough|deep\s?dive|extensive|full\s+report|detailed\s+report|'
@@ -2082,6 +2089,32 @@ DETAIL_INTENT_RE = re.compile(
 CHART_INTENT_RE = re.compile(
     r'\b(chart|graph|plot|visuali[sz]e|visuali[sz]ation|pie\s*chart|bar\s*chart|'
     r'line\s*chart|trend\s*graph|diagram|draw.*chart|show.*trend)\b',
+    re.IGNORECASE
+)
+
+# ── Explicit, code-level intent classification (NOT model-decided) ─────
+# The model was previously asked to self-select MODE A/B/C/D purely from
+# a persona-heavy, campaign-saturated system prompt. In practice that
+# biases it toward campaign/media-strategy framing even for a plain
+# "hi" or "what's the status today". These two regexes catch the two
+# most common everyday intents in code, so we can tell the model exactly
+# which mode to use instead of asking it to guess. This does NOT touch
+# is_detailed / wants_chart / plan-generation logic — those stay exactly
+# as they were.
+CASUAL_INTENT_RE = re.compile(
+    r'^\s*(hi|hii+|hello|hey|yo|sup|good\s?morning|good\s?afternoon|good\s?evening|'
+    r'gm|gn|namaste|kaise\s?ho|kya\s?haal|how\s+are\s+you|thanks?|thank\s?you|'
+    r'thnx|ty|ok(ay)?|cool|nice|great|bye|see\s?you|who\s+are\s+you|what\s+can\s+you\s+do)'
+    r'\s*[!.?]*\s*$',
+    re.IGNORECASE
+)
+
+STATUS_INTENT_RE = re.compile(
+    r'\b(current\s+status|status\s+update|what.?s\s+the\s+status|live\s+status|'
+    r'today.?s\s+risk|current\s+risk|risk\s+score|trigger\s+state|weather\s+(today|now|update)|'
+    r'rainfall|humidity|temperature|dengue\s+(cases|burden|numbers)|news\s+signal|'
+    r'top\s+keywords|geo\s+zones|dashboard\s+(state|data|numbers)|which\s+district(s)?\s+(is|are)|'
+    r'how\s+many\s+district|show\s+me\s+the\s+data|whats?\s+happening|overview)\b',
     re.IGNORECASE
 )
 
@@ -2164,6 +2197,19 @@ def ai_chat(message, history, live_context, geo_context=None, dashboard_context=
     wants_chart = bool(CHART_INTENT_RE.search(message))
     has_history = len(history) > 0
 
+    # ── Code-level classification (only relevant when NOT detailed — the
+    # detailed/plan-generation branch below is untouched) ─────────────
+    is_casual = bool(CASUAL_INTENT_RE.search(message.strip()))
+    is_status = bool(STATUS_INTENT_RE.search(message))
+    if is_casual and not is_status:
+        classified_mode = "MODE C — CASUAL CHAT"
+    elif is_status and not is_casual:
+        classified_mode = "MODE A — LIVE STATUS"
+    elif wants_chart:
+        classified_mode = "MODE D — CHART REQUEST"
+    else:
+        classified_mode = None  # ambiguous — let the model pick B/A/C itself
+
     if is_detailed:
         system = (
             "You are Laren, HIT RADAR's senior media strategy AI for India. "
@@ -2202,7 +2248,18 @@ def ai_chat(message, history, live_context, geo_context=None, dashboard_context=
             "current dashboard state. You are also a capable, knowledgeable general marketing/advertising assistant "
             "and a normal conversational AI — you are not limited to a rigid report format.\n\n"
 
-            "FIRST, decide which MODE this message needs:\n"
+            + (
+                f"MESSAGE HAS ALREADY BEEN CLASSIFIED AS: {classified_mode}. "
+                "Use that mode. Do NOT use campaign/report formatting (headers, →, budget, plan language) "
+                "unless that classification is MODE A or MODE D and the live data genuinely calls for it. "
+                "If classified CASUAL CHAT, reply in 1-2 short natural sentences ONLY — no headers, no bullet "
+                "points, no district data, no campaign talk, even if district/news data is available below.\n\n"
+                if classified_mode else ""
+            ) +
+
+            "FIRST, decide which MODE this message needs "
+            + ("(classification above is a strong prior — only override it if the message clearly contradicts it):\n"
+               if classified_mode else ":\n") +
             "MODE A — LIVE STATUS: the user is asking about current district risk, trigger states, weather, news, "
             "or dengue burden. Use ONLY the live data below, never fabricate a number, district, or headline. "
             "Follow the STRICT FORMAT RULES section.\n"
@@ -2303,6 +2360,15 @@ def ai_chat(message, history, live_context, geo_context=None, dashboard_context=
         except Exception as e:
             log.warning(f"⚠️ Failed to parse Laren plan JSON: {e}")
             plan = None
+
+        # Force the reference-only disclaimer in code — never rely on the
+        # model to remember to include it, so it can't be dropped/hallucinated
+        # away on any turn. Applied to BOTH the human-readable text and the
+        # structured plan JSON (the latter is what PDF/docx export reads from).
+        if PLAN_REFERENCE_DISCLAIMER not in text:
+            text = f"{text}\n\n{PLAN_REFERENCE_DISCLAIMER}"
+        if isinstance(plan, dict):
+            plan["disclaimer"] = PLAN_REFERENCE_DISCLAIMER
 
     # ── Split off the structured chart JSON (any mode, chart-intent) ─
     chart = None
