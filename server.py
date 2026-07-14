@@ -2232,13 +2232,33 @@ def ai_chat(message, history, live_context, geo_context=None, dashboard_context=
             "PART 2 — after the text, on its own line write exactly: ===PLAN_JSON===\n"
             "then a single raw JSON object (no markdown fence, no commentary before/after) with this schema:\n"
             '{"title": "string", "objective": "string", '
+            '"executive_summary": {"business_objective": "string", "media_objective": "string", "jtbd": "string"}, '
             '"budget_allocation": [{"district": "string", "pct": number, "rationale": "string"}], '
+            '"audience_architecture": [{"district": "string", "buyer_definition": "string", "barriers_motivators": "string", "touchpoints": ["string"]}], '
             '"channels": [{"district": "string", "channels": ["string"], "audience": "string"}], '
+            '"funnel_strategy": {"awareness": ["string"], "consideration": ["string"], "conversion": ["string"]}, '
             '"creative_themes": ["string"], '
+            '"creative_localization": [{"district": "string", "language": "string", "notes": "string"}], '
             '"timeline": [{"phase": "string", "activities": "string"}], '
-            '"kpis": [{"metric": "string", "target": "string"}]}\n'
+            '"kpis": [{"metric": "string", "target": "string"}], '
+            '"data_gaps": ["string"]}\n'
             "Only include districts in budget_allocation that are BOOST/PREPARE or explicitly named by the user. "
-            "pct values across budget_allocation should sum to 100. If there's nothing meaningful for a field, use an empty array. "
+            "pct values across budget_allocation should sum to 100. If there's nothing meaningful for a field, use an empty array or empty object. "
+            "executive_summary.business_objective and media_objective must be kept clearly separate (business outcome vs. media metric) — "
+            "do not state a precise numeric business target (e.g. '+1.5% volume share') unless the user explicitly gave that number; "
+            "otherwise phrase it directionally (e.g. 'grow volume share in high-risk districts'). "
+            "audience_architecture.buyer_definition must be derived only from the CHANNEL & AUDIENCE PROFILES data below — "
+            "never invent a persona that isn't grounded in that data. touchpoints must be real channels from that same data "
+            "(OOH, radio, retail, digital), not invented ones. "
+            "funnel_strategy channels must be a subset of the real channels already listed per district in CHANNEL & AUDIENCE PROFILES — "
+            "group them into awareness/consideration/conversion by channel type (e.g. CTV/programmatic video = awareness, "
+            "Meta/radio = consideration, retail media/search = conversion) — do not invent channels not present in the data. "
+            "creative_localization.language should be the standard regional language for that district's state (e.g. Assamese for "
+            "Guwahati/Dibrugarh, Hindi for Lucknow/Varanasi) — this is general knowledge, not live data, so keep it to language name only. "
+            "data_gaps MUST list, in plain language, any standard media-planning inputs this plan could NOT include because the live "
+            "data doesn't have them — always include at least: Category Development Index (CDI), competitor Share of Voice (SOV), "
+            "channel CPM/rate-card benchmarks, and MMM/geo-lift attribution modeling, since none of these exist in the data sections "
+            "below. Never fabricate numbers for these — only ever list them here as gaps requiring Planning team input. "
             "IMPORTANT: JSON string values must be PLAIN TEXT ONLY — never include markdown like ** or * or # inside any JSON field.\n\n"
         )
     else:
@@ -2369,6 +2389,13 @@ def ai_chat(message, history, live_context, geo_context=None, dashboard_context=
             text = f"{text}\n\n{PLAN_REFERENCE_DISCLAIMER}"
         if isinstance(plan, dict):
             plan["disclaimer"] = PLAN_REFERENCE_DISCLAIMER
+            if not plan.get("data_gaps"):
+                plan["data_gaps"] = [
+                    "Category Development Index (CDI) — not available in live data",
+                    "Competitor Share of Voice (SOV) — not available in live data",
+                    "Channel CPM / rate-card benchmarks — not available in live data",
+                    "MMM / geo-lift attribution modeling — requires dedicated statistical analysis, not generated here",
+                ]
 
     # ── Split off the structured chart JSON (any mode, chart-intent) ─
     chart = None
