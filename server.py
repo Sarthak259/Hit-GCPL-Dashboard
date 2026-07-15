@@ -130,6 +130,7 @@ CONFIG = {
     "GROQ_API_KEY":          os.getenv("GROQ_API_KEY",    ""),
     "GEMINI_API_KEY":        os.getenv("GEMINI_API_KEY",  ""),
     "MISTRAL_API_KEY":       os.getenv("MISTRAL_API_KEY", ""),
+    "UNSPLASH_ACCESS_KEY":   os.getenv("UNSPLASH_ACCESS_KEY", ""),
     "TELEGRAM_BOT_TOKEN":    os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "TELEGRAM_CHAT_ID":      os.getenv("TELEGRAM_CHAT_ID",   ""),
     "NEWSDATA_API_KEY":      os.getenv("NEWSDATA_API_KEY", ""),
@@ -1977,6 +1978,70 @@ def call_gemini(system_prompt, user_prompt, temperature=0.7, max_tokens=1000):
     return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
 
 
+def call_gemini_image(prompt, aspect_ratio="16:9"):
+    """
+    Generates an image via Gemini's native image model (gemini-3.1-flash-image-preview,
+    aka "Nano Banana 2") using the SAME GEMINI_API_KEY already configured for text chat —
+    same generateContent endpoint, different model, response contains inline base64 image
+    data instead of text. Returns a data: URI string, or None on failure.
+    """
+    key = CONFIG.get("GEMINI_API_KEY", "")
+    if not key:
+        raise ValueError("GEMINI_API_KEY not set")
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={key}",
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["IMAGE"],
+                "imageConfig": {"aspectRatio": aspect_ratio},
+            },
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    parts = resp.json()["candidates"][0]["content"]["parts"]
+    for part in parts:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline and inline.get("data"):
+            mime = inline.get("mimeType", "image/png")
+            return f"data:{mime};base64,{inline['data']}"
+    return None
+
+
+def fetch_unsplash_image(query, orientation="landscape"):
+    """
+    Fetches a real, licensed royalty-free photo from Unsplash for a given
+    context (e.g. "Mumbai monsoon flooding street"). orientation='landscape'
+    guarantees a rectangular (wide) image — never portrait/square — matching
+    the report layout. Returns {'url', 'credit_name', 'credit_link'} or None.
+    """
+    key = CONFIG.get("UNSPLASH_ACCESS_KEY", "")
+    if not key:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.unsplash.com/search/photos",
+            params={"query": query, "orientation": orientation, "per_page": 1, "content_filter": "high"},
+            headers={"Authorization": f"Client-ID {key}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if not results:
+            return None
+        photo = results[0]
+        return {
+            "url": photo["urls"]["regular"],  # already rectangular per orientation filter
+            "credit_name": photo["user"]["name"],
+            "credit_link": photo["user"]["links"]["html"] + "?utm_source=hit_radar&utm_medium=referral",
+        }
+    except Exception as e:
+        log.warning(f"⚠️ Unsplash fetch failed for '{query}': {e}")
+        return None
+
+
 def call_mistral(system_prompt, user_prompt, temperature=0.7, max_tokens=800):
     key = CONFIG.get("MISTRAL_API_KEY", "")
     if not key:
@@ -2805,6 +2870,81 @@ def api_ai_chat():
         dashboard_context=payload.get("dashboard_context", {}),
     )
     return jsonify(result)
+
+
+@app.route("/api/ai/generate-creative-image", methods=["POST"])
+def api_generate_creative_image():
+    """
+    Generates an ORIGINAL AI creative-concept image (poster/illustration style)
+    for a plan's creative theme — via Gemini's native image model. This is
+    always clearly an AI-generated concept, never presented as a real photo.
+    """
+    payload = request.json or {}
+    theme = (payload.get("theme") or "").strip()
+    if not theme:
+        return jsonify({"error": "theme required"}), 400
+    try:
+        prompt = (
+            f"Flat vector illustration poster for a public health awareness campaign. "
+            f"Theme: \"{theme}\". Clean modern flat-design style, bold simple shapes, "
+            f"limited color palette (teal/cyan/orange), friendly approachable tone, "
+            f"NO photorealism, NO readable body text/paragraphs — at most a short 2-4 word "
+            f"headline in clean sans-serif type. Wide rectangular composition, professional "
+            f"marketing-creative quality, no watermarks, no logos."
+        )
+        image_data_uri = call_gemini_image(prompt, aspect_ratio="16:9")
+        if not image_data_uri:
+            return jsonify({"error": "Image generation returned no image"}), 502
+        return jsonify({"image": image_data_uri, "type": "ai_generated_concept"})
+    except Exception as e:
+        log.warning(f"⚠️ Creative image generation failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ai/generate-funnel-image", methods=["POST"])
+def api_generate_funnel_image():
+    """
+    Generates a full-funnel visual (Awareness → Consideration → Conversion)
+    as an AI illustration — labels/stage names only, NO numbers or stats,
+    since image models render digits unreliably. Real numeric funnel data
+    stays in the Chart.js bar chart, not this image.
+    """
+    payload = request.json or {}
+    stages = payload.get("stages") or ["Awareness", "Consideration", "Conversion"]
+    try:
+        stage_list = " → ".join(stages)
+        prompt = (
+            f"Flat vector infographic illustration of a marketing funnel with exactly these "
+            f"stages left to right: {stage_list}. Each stage as a labeled geometric segment "
+            f"(funnel/arrow shape) with a short 1-2 word text label matching the stage name — "
+            f"NO numbers, NO statistics, NO percentages, NO data figures anywhere in the image, "
+            f"purely conceptual and visual. Clean modern flat-design style, teal/cyan/purple "
+            f"gradient palette, wide rectangular composition, professional quality, no watermarks."
+        )
+        image_data_uri = call_gemini_image(prompt, aspect_ratio="16:9")
+        if not image_data_uri:
+            return jsonify({"error": "Image generation returned no image"}), 502
+        return jsonify({"image": image_data_uri, "type": "ai_generated_concept"})
+    except Exception as e:
+        log.warning(f"⚠️ Funnel image generation failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/ai/context-photo", methods=["POST"])
+def api_context_photo():
+    """
+    Fetches a REAL, licensed, rectangular (landscape) stock photo from Unsplash
+    for context (e.g. district monsoon/flood scenes) — never AI-generated,
+    never scraped from copyrighted news sources. Always returns proper credit.
+    """
+    payload = request.json or {}
+    query = (payload.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "query required"}), 400
+    photo = fetch_unsplash_image(query, orientation="landscape")
+    if not photo:
+        return jsonify({"error": "No Unsplash result / UNSPLASH_ACCESS_KEY not configured"}), 404
+    return jsonify(photo)
 
 
 @app.route("/api/ai/news-narrative", methods=["GET"])
