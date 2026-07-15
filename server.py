@@ -2001,11 +2001,11 @@ def call_gemini_image(prompt, aspect_ratio="16:9"):
         },
     }
     last_error = None
-    for attempt in range(1, 3):  # 1 initial try + 1 retry
+    for attempt in range(1, 4):  # 1 initial try + 2 retries
         try:
             resp = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=60)
-            if resp.status_code == 429 and attempt < 2:
-                time.sleep(5)
+            if resp.status_code == 429 and attempt < 3:
+                time.sleep(attempt * 12)  # 12s, then 24s — free-tier image quota needs real cooldown
                 continue
             resp.raise_for_status()
             parts = resp.json()["candidates"][0]["content"]["parts"]
@@ -2017,7 +2017,7 @@ def call_gemini_image(prompt, aspect_ratio="16:9"):
             return None
         except Exception as e:
             last_error = e
-            if attempt >= 2:
+            if attempt >= 3:
                 raise
     raise last_error
 
@@ -2439,7 +2439,13 @@ def ai_chat(message, history, live_context, geo_context=None, dashboard_context=
         f"{m['role'].upper()}: {m['content']}" for m in messages
     ])
 
-    max_tok = 1800 if is_detailed else (1200 if wants_chart else 800)
+    # The detailed plan schema now includes 9+ sections (exec summary, budget,
+    # audience architecture, funnel, localization, timeline, KPIs, data gaps,
+    # plus the human-readable PART 1 text) — 1800 tokens was enough for the
+    # old, smaller schema but truncates mid-JSON on this one, producing
+    # invalid/unparseable JSON ("Unterminated string..."). Bumped to give the
+    # model real headroom to finish the JSON object cleanly.
+    max_tok = 4000 if is_detailed else (1200 if wants_chart else 800)
     temp = 0.5 if is_detailed else 0.6
     result = call_ai(system, full_prompt, prefer="groq", temperature=temp, max_tokens=max_tok)
 
@@ -2455,8 +2461,23 @@ def ai_chat(message, history, live_context, geo_context=None, dashboard_context=
         try:
             plan = json.loads(json_part)
         except Exception as e:
-            log.warning(f"⚠️ Failed to parse Laren plan JSON: {e}")
+            log.warning(f"⚠️ Failed to parse Laren plan JSON (attempt 1): {e}")
             plan = None
+            # Safety net: the model may have produced an unusually long plan
+            # (many districts) that still overran the token budget. Retry once
+            # with significantly more headroom before giving up.
+            try:
+                retry_result = call_ai(system, full_prompt, prefer="groq", temperature=temp, max_tokens=6500)
+                retry_text = retry_result.get("text", "")
+                if "===PLAN_JSON===" in retry_text:
+                    retry_human, _, retry_json = retry_text.partition("===PLAN_JSON===")
+                    retry_json = re.sub(r'^```(?:json)?\s*|\s*```$', '', retry_json.strip())
+                    plan = json.loads(retry_json)
+                    text = retry_human.strip()
+                    result = retry_result
+            except Exception as e2:
+                log.warning(f"⚠️ Failed to parse Laren plan JSON (retry): {e2}")
+                plan = None
 
         # Force the reference-only disclaimer in code — never rely on the
         # model to remember to include it, so it can't be dropped/hallucinated
