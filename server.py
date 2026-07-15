@@ -1984,30 +1984,42 @@ def call_gemini_image(prompt, aspect_ratio="16:9"):
     aka "Nano Banana 2") using the SAME GEMINI_API_KEY already configured for text chat —
     same generateContent endpoint, different model, response contains inline base64 image
     data instead of text. Returns a data: URI string, or None on failure.
+
+    Retries on 429 (rate limit) with backoff — this model has a tight per-minute
+    quota, so a single retry after a short wait meaningfully improves success rate
+    when the frontend is also spacing out its own calls.
     """
     key = CONFIG.get("GEMINI_API_KEY", "")
     if not key:
         raise ValueError("GEMINI_API_KEY not set")
-    resp = requests.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={key}",
-        headers={"Content-Type": "application/json"},
-        json={
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseModalities": ["IMAGE"],
-                "imageConfig": {"aspectRatio": aspect_ratio},
-            },
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent?key={key}"
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {"aspectRatio": aspect_ratio},
         },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    parts = resp.json()["candidates"][0]["content"]["parts"]
-    for part in parts:
-        inline = part.get("inlineData") or part.get("inline_data")
-        if inline and inline.get("data"):
-            mime = inline.get("mimeType", "image/png")
-            return f"data:{mime};base64,{inline['data']}"
-    return None
+    }
+    last_error = None
+    for attempt in range(1, 3):  # 1 initial try + 1 retry
+        try:
+            resp = requests.post(url, headers={"Content-Type": "application/json"}, json=body, timeout=60)
+            if resp.status_code == 429 and attempt < 2:
+                time.sleep(5)
+                continue
+            resp.raise_for_status()
+            parts = resp.json()["candidates"][0]["content"]["parts"]
+            for part in parts:
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    mime = inline.get("mimeType", "image/png")
+                    return f"data:{mime};base64,{inline['data']}"
+            return None
+        except Exception as e:
+            last_error = e
+            if attempt >= 2:
+                raise
+    raise last_error
 
 
 def fetch_unsplash_image(query, orientation="landscape"):
@@ -2934,17 +2946,30 @@ def api_generate_funnel_image():
 def api_context_photo():
     """
     Fetches a REAL, licensed, rectangular (landscape) stock photo from Unsplash
-    for context (e.g. district monsoon/flood scenes) — never AI-generated,
-    never scraped from copyrighted news sources. Always returns proper credit.
+    for a district — never AI-generated, never scraped from copyrighted news
+    sources. Tries flood/waterlogging-specific queries for the city first
+    (most relevant to a dengue/monsoon risk plan), then falls back to
+    progressively broader monsoon queries if that specific city has no
+    flood-tagged photos on Unsplash. Always returns proper credit.
     """
     payload = request.json or {}
-    query = (payload.get("query") or "").strip()
-    if not query:
-        return jsonify({"error": "query required"}), 400
-    photo = fetch_unsplash_image(query, orientation="landscape")
-    if not photo:
-        return jsonify({"error": "No Unsplash result / UNSPLASH_ACCESS_KEY not configured"}), 404
-    return jsonify(photo)
+    city = (payload.get("city") or payload.get("query") or "").strip()
+    if not city:
+        return jsonify({"error": "city required"}), 400
+
+    query_chain = [
+        f"{city} flood India",
+        f"{city} waterlogging monsoon",
+        f"{city} India monsoon rain street",
+        "India monsoon flood street",
+    ]
+    for q in query_chain:
+        photo = fetch_unsplash_image(q, orientation="landscape")
+        if photo:
+            photo["query_used"] = q
+            return jsonify(photo)
+
+    return jsonify({"error": "No Unsplash result / UNSPLASH_ACCESS_KEY not configured"}), 404
 
 
 @app.route("/api/ai/news-narrative", methods=["GET"])
