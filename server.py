@@ -20,7 +20,7 @@
 
 Run:
     pip install flask flask-cors requests apscheduler feedparser groq google-generativeai pdfplumber openpyxl
-    python server.py
+    python server.py 
 """
 
 # ══════════════════════════════════════════════════════════════════════
